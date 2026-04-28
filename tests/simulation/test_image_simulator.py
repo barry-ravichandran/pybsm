@@ -3,10 +3,12 @@ from __future__ import annotations
 import warnings
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pytest
 from PIL import Image
+from scipy import interpolate
 from syrupy.assertion import SnapshotAssertion
 
 from pybsm import simulation
@@ -1093,10 +1095,8 @@ class TestPhotoelectronsToPixels:
 
     def test_analytical_matches_interp1d_argument_swap(self) -> None:
         """The cached analytical inverse matches an explicit interp1d swap."""
-        from scipy import interpolate
-
         simulator, _img = _build_simulator()
-        fwd = simulator._reflect_to_photoelectrons
+        fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
         ref_inv = interpolate.interp1d(fwd.y, fwd.x)
         pe_sample = np.linspace(simulator._fwd_y_min, simulator._fwd_y_max, 100_000)
         analytical = simulator.photoelectrons_to_reflectance(pe_sample, clip_to_unit=False)
@@ -1303,8 +1303,9 @@ class TestPhotoelectronsToPixels:
         """Replacing _reflect_to_photoelectrons rebuilds (A, B) on next call."""
         simulator, _img = _build_simulator()
         original_a, original_b = simulator._affine_pe_coefs
-        new_ref = simulator._reflect_to_photoelectrons.x
-        new_pe = simulator._reflect_to_photoelectrons.y * 10.0
+        fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
+        new_ref = fwd.x
+        new_pe = fwd.y * 10.0
         simulator._reflect_to_photoelectrons = interpolate.interp1d(new_ref, new_pe)
         simulator.photoelectrons_to_pixels(np.array([new_pe[0], new_pe[-1]]))
         new_a, new_b = simulator._affine_pe_coefs
@@ -1315,8 +1316,9 @@ class TestPhotoelectronsToPixels:
         """Replacing fwd with a copy whose y[-1] differs rebuilds (A, B)."""
         simulator, _img = _build_simulator()
         original_a, _original_b = simulator._affine_pe_coefs
-        ref_grid = simulator._reflect_to_photoelectrons.x.copy()
-        pe_grid = simulator._reflect_to_photoelectrons.y.copy()
+        fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
+        ref_grid = fwd.x.copy()
+        pe_grid = fwd.y.copy()
         pe_grid[-1] = pe_grid[-1] * 2.0
         simulator._reflect_to_photoelectrons = interpolate.interp1d(ref_grid, pe_grid)
         simulator.photoelectrons_to_pixels(np.array([pe_grid[0], pe_grid[-1]]))
@@ -1327,7 +1329,8 @@ class TestPhotoelectronsToPixels:
         """Documented contract: interior `.y` mutation is NOT detected (callers replace fwd)."""
         simulator, _img = _build_simulator()
         snapshot = simulator._affine_pe_coefs
-        simulator._reflect_to_photoelectrons.y[50] = simulator._reflect_to_photoelectrons.y[50] * 1.5
+        fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
+        fwd.y[50] = fwd.y[50] * 1.5
         simulator.photoelectrons_to_pixels(np.array([simulator._fwd_y_min, simulator._fwd_y_max]))
         assert simulator._affine_pe_coefs == snapshot
 
@@ -1351,11 +1354,9 @@ class TestPhotoelectronsToPixels:
         pe array to materially different pixel arrays, proving the output
         tracks the sensor configuration, not per-image stats.
         """
-        from scipy import interpolate
-
         simulator, _img = _build_simulator()
         # Original forward map for simulator A.
-        fwd_a = simulator._reflect_to_photoelectrons
+        fwd_a = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
         # Build a divergent forward map for simulator B by shifting both endpoints.
         # Note: this pure-offset shift is a unit-test contrivance — a real
         # sensor recalibration would change both slope and intercept. We just
@@ -1374,10 +1375,9 @@ class TestPhotoelectronsToPixels:
 
     def test_a_zero_degenerate_raises(self) -> None:
         """A constant forward map (A=0) raises ValueError on inversion."""
-        from scipy import interpolate
-
         simulator, _img = _build_simulator()
-        ref_grid = simulator._reflect_to_photoelectrons.x.copy()
+        fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
+        ref_grid = fwd.x.copy()
         pe_const = np.full_like(ref_grid, 1000.0)
         simulator._reflect_to_photoelectrons = interpolate.interp1d(ref_grid, pe_const)
         with pytest.raises(ValueError, match="A=0"):
@@ -1436,18 +1436,26 @@ class TestPhotoelectronsToPixels:
         with pytest.raises(RuntimeError, match="non-finite image"):
             simulator.apply_noise(arr)
 
-    def test_apply_noise_finite_input_does_not_raise(self) -> None:
-        """The new finite-value guard does not regress the clean noise path."""
+    @pytest.mark.parametrize(
+        "shape",
+        [(32, 32), (32, 32, 3), (0, 32), (0, 32, 3)],
+        ids=["full_2D", "full_3D", "empty_2D", "empty_3D"],
+    )
+    def test_apply_noise_finite_input_passes_through(self, shape: tuple[int, ...]) -> None:
+        """Finite (including empty) inputs flow through the guard and dispatch shape-unchanged.
+
+        Two sentinels merged: full-shaped finite input does not regress on the
+        new finite-value guard; empty 2D/3D inputs short-circuit through the
+        guard (``np.all(np.isfinite(empty))`` is trivially ``True``) and the
+        numba kernels operate on zero-element scratch buffers without error.
+        """
         simulator, _img = _build_simulator()
         simulator._add_noise = True
         simulator._g_noise = 1.0
-        # 3D and 2D both pass through.
-        out_3d = simulator.apply_noise(np.full((32, 32, 3), 100.0, dtype=np.float64))
-        out_2d = simulator.apply_noise(np.full((32, 32), 100.0, dtype=np.float64))
-        assert out_3d.shape == (32, 32, 3)
-        assert out_2d.shape == (32, 32)
-        assert np.all(np.isfinite(out_3d))
-        assert np.all(np.isfinite(out_2d))
+        arr = np.empty(shape, dtype=np.float64) if 0 in shape else np.full(shape, 100.0, dtype=np.float64)
+        out = simulator.apply_noise(arr)
+        assert out.shape == shape
+        assert np.all(np.isfinite(out))
 
     def test_cross_shape_simulate_image_is_stable(self) -> None:
         """Sentinel: pyBSM's PSF cache and noise functions are shape-independent.

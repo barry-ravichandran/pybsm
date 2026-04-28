@@ -30,3 +30,9 @@ Fixes
   that propagated through the FFT and hung the simulator on synthetic
   flat inputs. Uniform inputs now map to the midpoint of the configured
   ``reflectance_range``.
+
+* Fixed an indefinite hang in ``ImageSimulator.apply_noise`` when called
+  on an array containing ``NaN`` (numba parallel-fastmath does not handle
+  ``NaN`` Poisson lambdas, hanging the worker thread). ``apply_noise``
+  now raises ``RuntimeError`` with the NaN/Inf counts and shape, failing
+  fast instead of hanging silently.

@@ -385,9 +385,27 @@ class ImageSimulator(ABC):
 
         Returns:
             Image with noise applied if add_noise is True, otherwise original image.
+
+        Raises:
+            RuntimeError: If ``image`` contains any ``NaN`` or ``Inf`` value
+                while ``add_noise`` is enabled. ``_apply_noise{2,3}d`` runs
+                under numba parallel-fastmath, where ``np.random.poisson(NaN)``
+                hangs the worker thread indefinitely; this guard fails fast
+                instead of stalling. Inf is rejected on the same contract for
+                consistency with the non-finite input guard on
+                ``photoelectrons_to_pixels``.
         """
         if not self.add_noise:
             return image
+
+        if not np.all(np.isfinite(image)):
+            raise RuntimeError(
+                f"ImageSimulator.apply_noise: non-finite image "
+                f"(nan={int(np.isnan(image).sum())}, "
+                f"inf={int(np.isinf(image).sum())}, shape={image.shape}). "
+                f"_apply_noise2d / _apply_noise3d would hang on NaN under numba "
+                f"parallel-fastmath; refusing to dispatch.",
+            )
 
         # poisson_noisy_img = self._rng.poisson(lam=image)
         # return self._rng.normal(poisson_noisy_img, self._g_noise)

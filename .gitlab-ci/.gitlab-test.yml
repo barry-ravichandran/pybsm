@@ -29,6 +29,12 @@ notebooks:
           "pybsm_visualization.ipynb"
         ]
 
+# Overrides devel-jatic to add 3.14. May be removed if/when devel-jatic is likewise updated
+.python-versions:
+  parallel:
+    matrix:
+      - PYTHON_VERSION: [ "3.10", "3.11", "3.12", "3.13", "3.14" ]
+
 # Job to ensure the provided example script still runs
 # NOTE: this version of tests was to confirm the original pybsm_example.py
 # functioned properly, just as a dummy placeholder for unit testing. Until

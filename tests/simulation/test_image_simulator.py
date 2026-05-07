@@ -1384,20 +1384,26 @@ class TestPhotoelectronsToPixels:
             simulator.photoelectrons_to_reflectance(np.array([1000.0]))
 
     @pytest.mark.parametrize(
-        "shape",
-        [(0,), (0, 4)],
-        ids=["empty_1D", "empty_2D"],
+        ("shape", "mode"),
+        [
+            ((0,), "radiometric"),
+            ((0, 4), "radiometric"),
+            ((0,), "minmax"),
+            ((0, 4), "minmax"),
+        ],
+        ids=["empty_1D_radio", "empty_2D_radio", "empty_1D_minmax", "empty_2D_minmax"],
     )
-    def test_pe_to_pixels_empty_input_returns_empty(self, shape: tuple[int, ...]) -> None:
-        """Empty input short-circuits before the clip-fraction divide-by-size.
+    def test_pe_to_pixels_empty_input_returns_empty(self, shape: tuple[int, ...], mode: str) -> None:
+        """Empty input short-circuits before the clip-fraction divide-by-size — for both modes.
 
-        All ``size == 0`` shapes hit the same early-return branch; one 1D and
-        one 2D case are sufficient to pin both ``size==0`` short-circuit and
-        ``np.empty(shape, ...)`` shape preservation.
+        All ``size == 0`` shapes hit the same early-return branch (which sits
+        before the mode dispatch), regardless of ``mode``. One 1D and one 2D
+        case per mode is sufficient to pin both the ``size==0`` short-circuit
+        and ``np.empty(shape, ...)`` shape preservation.
         """
         simulator, _img = _build_simulator()
         empty = np.empty(shape, dtype=np.float64)
-        out = simulator.photoelectrons_to_pixels(empty)
+        out = simulator.photoelectrons_to_pixels(empty, mode=mode)  # type: ignore[arg-type]
         assert out.shape == shape
         assert out.dtype == np.float64
         assert out.size == 0
@@ -1479,3 +1485,79 @@ class TestPhotoelectronsToPixels:
         _, blur_b, _ = simulator.simulate_image(small, gsd=gsd)
         assert np.all(np.isfinite(blur_b))
         assert blur_b.shape == small.shape
+
+    def test_minmax_mode_basic_remap(self) -> None:
+        """``mode="minmax"`` stretches input min/max linearly into ``[p1, p2]``."""
+        simulator, _img = _build_simulator()
+        pe = np.linspace(1000.0, 50_000.0, 256)
+        pixels = simulator.photoelectrons_to_pixels(pe, mode="minmax")
+        assert pixels[0] == pytest.approx(0.0, abs=1e-9)
+        assert pixels[-1] == pytest.approx(255.0, abs=1e-9)
+        assert np.all(np.diff(pixels) >= 0.0)
+
+    def test_minmax_mode_uniform_input_returns_midpoint(self) -> None:
+        """Uniform input on the minmax path mirrors apply_convolution's §5 convention."""
+        simulator, _img = _build_simulator()
+        pe = np.full(64, 1234.0)
+        pixels = simulator.photoelectrons_to_pixels(pe, mode="minmax")
+        np.testing.assert_array_equal(pixels, np.full(64, 127.5, dtype=np.float64))
+
+    def test_minmax_mode_custom_output_range(self) -> None:
+        """Custom ``p1`` / ``p2`` correctly bound the minmax output."""
+        simulator, _img = _build_simulator()
+        pe = np.linspace(0.0, 1000.0, 128)
+        pixels = simulator.photoelectrons_to_pixels(pe, p1=10.0, p2=200.0, mode="minmax")
+        assert pixels[0] == pytest.approx(10.0, abs=1e-9)
+        assert pixels[-1] == pytest.approx(200.0, abs=1e-9)
+        assert np.all((pixels >= 10.0) & (pixels <= 200.0))
+
+    def test_minmax_mode_invalid_raises(self) -> None:
+        """Unknown ``mode`` value raises ValueError before any computation."""
+        simulator, _img = _build_simulator()
+        with pytest.raises(ValueError, match="mode must be 'radiometric' or 'minmax'"):
+            simulator.photoelectrons_to_pixels(np.array([1.0, 2.0]), mode="bogus")  # type: ignore[arg-type]
+
+    def test_minmax_mode_works_with_use_reflectance_false(self) -> None:
+        """Minmax bypasses cache + ADC entirely; it works regardless of ``use_reflectance``."""
+        simulator, _img = _build_simulator(use_reflectance=False)
+        pe = np.linspace(0.0, 32400.0, 128)
+        pixels = simulator.photoelectrons_to_pixels(pe, mode="minmax")
+        assert pixels[0] == pytest.approx(0.0, abs=1e-9)
+        assert pixels[-1] == pytest.approx(255.0, abs=1e-9)
+        # No observability state was touched (sensor-agnostic path).
+        assert simulator._last_clip_fraction == (0.0, 0.0)
+
+    def test_minmax_and_radiometric_diverge_under_sensor_calibration(self) -> None:
+        """Same pe input, two simulators: minmax outputs match, radiometric outputs differ.
+
+        Pins the behavioral boundary between the two modes. Minmax is
+        sensor-agnostic (only depends on per-image min/max), so the same
+        input produces the same output across simulators with materially
+        different forward calibrations. Radiometric is sensor-calibrated
+        (depends on cached ``(A, B)`` and ``reflectance_range``), so the
+        same input produces materially different outputs.
+        """
+        simulator_a, _img = _build_simulator()
+        simulator_b, _img = _build_simulator()
+        # Both simulators start with the same forward map; divergent map for B
+        # is built by offsetting the y-endpoints of the shared baseline.
+        # Note: this pure-offset shift is a unit-test contrivance — a real
+        # sensor recalibration would change both slope and intercept. The
+        # purpose here is to produce a different ``(A, B)`` so radiometric
+        # outputs diverge while minmax outputs stay identical.
+        fwd = cast(interpolate.interp1d, simulator_b._reflect_to_photoelectrons)
+        ref_b = fwd.x.copy()
+        pe_b = fwd.y.copy() + (fwd.y[-1] - fwd.y[0]) * 0.5
+        simulator_b._reflect_to_photoelectrons = interpolate.interp1d(ref_b, pe_b)
+        pe_input = np.linspace(fwd.y[0], fwd.y[-1], 5000)
+        # Minmax: identical (per-image stretch ignores sensor).
+        minmax_a = simulator_a.photoelectrons_to_pixels(pe_input, mode="minmax")
+        minmax_b = simulator_b.photoelectrons_to_pixels(pe_input, mode="minmax")
+        np.testing.assert_array_equal(minmax_a, minmax_b)
+        # Radiometric: materially different (sensor-calibrated).
+        radio_a = simulator_a.photoelectrons_to_pixels(pe_input, mode="radiometric")
+        radio_b = simulator_b.photoelectrons_to_pixels(pe_input, mode="radiometric")
+        # A 0.5×y-range shift produces a mean uint8 difference well over 30;
+        # threshold 5.0 is an order of magnitude below that to avoid
+        # float-precision flakiness without weakening the assertion.
+        assert abs(radio_a.mean() - radio_b.mean()) > 5.0

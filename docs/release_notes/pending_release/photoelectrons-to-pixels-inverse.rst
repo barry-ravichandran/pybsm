@@ -11,6 +11,11 @@ Updates / New Features
   routes through the sensor's ADC model (well capacity by bit-depth
   quantization) — the physically correct mapping for raw-pixel mode.
 
+* Added ``mode="minmax"`` opt-in to ``photoelectrons_to_pixels`` for use
+  cases (e.g. PSF / blur-kernel comparison on a fixed scene) where
+  radiometric fidelity is irrelevant and per-image histogram stretch is
+  preferred. Default remains ``mode="radiometric"``.
+
 * Added three observability guards on the new inverse path: hard-fail on
   non-finite inputs, once-per-instance warning when >1% of pixels clip at
   the forward-table boundary, and once-per-instance warning on first

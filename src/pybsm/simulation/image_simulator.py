@@ -511,22 +511,36 @@ class ImageSimulator(ABC):
         photoelectrons_img: np.ndarray,
         p1: float = 0.0,
         p2: float = 255.0,
+        *,
+        mode: Literal["radiometric", "minmax"] = "radiometric",
     ) -> np.ndarray:
-        """Map photoelectrons to display-pixel range, preserving radiometry.
+        """Map photoelectrons to display-pixel range.
 
-        For ``use_reflectance=True`` (the reflectance pipeline), inverts the
-        forward map analytically and linearly remaps reflectance into
-        ``[p1, p2]``. For ``use_reflectance=False`` (raw-pixel mode), routes
-        through the sensor's ADC model (well capacity x bit-depth quantization).
+        Two mapping modes are supported:
 
-        Unlike per-image min-max normalization, the output is determined by the
-        sensor configuration — two sensors viewing the same scene produce
-        different (but radiometrically faithful) outputs.
+        - ``mode="radiometric"`` (default): radiometrically faithful,
+          sensor-calibrated mapping. For ``use_reflectance=True``, inverts
+          the forward map analytically and linearly remaps reflectance into
+          ``[p1, p2]``. For ``use_reflectance=False``, routes through the
+          sensor's ADC model (well capacity x bit-depth quantization). Two
+          sensors viewing the same scene produce different but
+          radiometrically faithful outputs — preserves cross-sensor
+          consistency. Choose this for any analysis comparing outputs
+          across sensors or against a reference.
+        - ``mode="minmax"``: per-image min-max normalization. Stretches the
+          input histogram linearly to fill ``[p1, p2]``. Useful for
+          qualitative inspection (e.g. comparing PSF / blur-kernel effects
+          on a fixed scene) where radiometric fidelity is irrelevant.
+          **Not** suitable for cross-sensor comparison — destroys
+          radiometric consistency. Sensor-agnostic: ignores
+          ``use_reflectance`` and the forward grid entirely.
 
         Args:
             photoelectrons_img: Photoelectron array.
             p1: Lower bound of the output pixel range. Default 0.0.
             p2: Upper bound of the output pixel range. Default 255.0.
+            mode: ``"radiometric"`` (default) or ``"minmax"``. See the
+                method-level description above for the trade-offs.
 
         Returns:
             Pixel array of the same shape as ``photoelectrons_img``, dtype ``float64``.
@@ -534,12 +548,13 @@ class ImageSimulator(ABC):
 
         Raises:
             ValueError: If the output range is not strictly ascending
-                (``p1 >= p2``).
+                (``p1 >= p2``), or if ``mode`` is not one of
+                ``"radiometric"`` / ``"minmax"``.
             RuntimeError: If ``photoelectrons_img`` contains NaN or Inf — refuses to
                 silently cast non-finite values to 0.
 
         Note:
-            Two clipping stages run on the reflectance path, with asymmetric
+            On the radiometric path, two clipping stages run with asymmetric
             observability. Pe-domain clipping at the forward-table boundary
             (``[_fwd_y_min, _fwd_y_max]``) is reported via
             ``_last_clip_fraction`` and a once-per-instance warning when
@@ -549,12 +564,17 @@ class ImageSimulator(ABC):
             outside the requested range, which the trailing ``np.clip``
             squashes to prevent uint8-cast wraparound. Callers that need to
             audit pixel-domain clipping should compare ``pre-clip`` vs
-            ``post-clip`` themselves.
+            ``post-clip`` themselves. The minmax path uses a single trailing
+            clip and no observability state.
         """
         if p1 >= p2:
             raise ValueError(
                 f"ImageSimulator.photoelectrons_to_pixels: output range must be strictly ascending; "
                 f"got p1={p1!r}, p2={p2!r}.",
+            )
+        if mode not in {"radiometric", "minmax"}:
+            raise ValueError(
+                f"ImageSimulator.photoelectrons_to_pixels: mode must be 'radiometric' or 'minmax'; got mode={mode!r}.",
             )
 
         # Hard-fail on non-finite input — silent NaN->0 cast on the eventual
@@ -567,9 +587,21 @@ class ImageSimulator(ABC):
                 f"Likely an upstream simulate_image() bug.",
             )
 
-        # Empty input: short-circuit before clip-fraction division by size.
+        # Empty input: short-circuit before any per-image min/max or
+        # clip-fraction division by size.
         if photoelectrons_img.size == 0:
             return np.empty(photoelectrons_img.shape, dtype=np.float64)
+
+        if mode == "minmax":
+            # Per-image stretch — sensor-agnostic. Uniform input mirrors the
+            # apply_convolution §5 convention: produce a constant midpoint
+            # output (deterministic, finite) instead of a divide-by-zero.
+            pe_min = float(photoelectrons_img.min())
+            pe_max = float(photoelectrons_img.max())
+            if pe_max == pe_min:
+                return np.full(photoelectrons_img.shape, (p1 + p2) / 2.0, dtype=np.float64)
+            pixels = (photoelectrons_img.astype(np.float64) - pe_min) / (pe_max - pe_min) * (p2 - p1) + p1
+            return np.clip(pixels, p1, p2)
 
         if self._use_reflectance:
             self._validate_inverse_cache()

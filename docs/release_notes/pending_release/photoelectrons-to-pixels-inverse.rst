@@ -1,43 +1,26 @@
 Updates / New Features
 ----------------------
 
-* Added ``ImageSimulator.photoelectrons_to_reflectance`` and
-  ``ImageSimulator.photoelectrons_to_pixels`` — analytical inverse of the
-  forward reflectance to photoelectrons map. Enables radiometrically
-  faithful photoelectron-to-pixel mapping in downstream consumers, replacing per-image
-  min-max normalization that destroyed cross-sensor consistency.
+* Added a sensor-calibrated inverse on ``ImageSimulator``:
+  ``photoelectrons_to_reflectance`` and ``photoelectrons_to_pixels``
+  convert the photoelectron output of ``simulate_image`` back into
+  reflectance or display pixels, with output that tracks the sensor's
+  calibration (so two sensors viewing the same scene produce comparable
+  pixels). ``photoelectrons_to_pixels`` also accepts ``mode="minmax"``
+  for per-image min-max stretch — useful for side-by-side qualitative
+  comparisons on a fixed scene, but not suitable for cross-sensor work.
 
-* For ``use_reflectance=False`` simulators, ``photoelectrons_to_pixels``
-  routes through the sensor's ADC model (well capacity by bit-depth
-  quantization) — the physically correct mapping for raw-pixel mode.
-
-* Added ``mode="minmax"`` opt-in to ``photoelectrons_to_pixels`` for use
-  cases (e.g. PSF / blur-kernel comparison on a fixed scene) where
-  radiometric fidelity is irrelevant and per-image histogram stretch is
-  preferred. Default remains ``mode="radiometric"``.
-
-* Added three observability guards on the new inverse path: hard-fail on
-  non-finite inputs, once-per-instance warning when >1% of pixels clip at
-  the forward-table boundary, and once-per-instance warning on first
-  fallback to ADC quantization. Also added automatic cache invalidation
-  that keeps the analytical inverse coefficients consistent when
-  ``_reflect_to_photoelectrons`` is replaced or boundary-mutated.
-
-* Documented the ``Scenario(interp=True)`` envelope contract — accepts any
-  ``ground_range`` and ``altitude`` inside the MODTRAN grid envelope; the
-  exact-grid-entry restriction applies only when ``interp=False``.
+* Clarified the input range for ``Scenario(interp=True)``: ``altitude``
+  and ``ground_range`` may be any value within the MODTRAN tabulation
+  bounds, not just exact tabulated entries (with ``interp=False`` the
+  inputs still have to be exact entries).
 
 Fixes
 -----
 
-* Fixed ``ImageSimulator.apply_convolution`` divide-by-zero on uniform-gray
-  input images. Previously, ``image.min() == image.max()`` produced NaN
-  that propagated through the FFT and hung the simulator on synthetic
-  flat inputs. Uniform inputs now map to the midpoint of the configured
-  ``reflectance_range``.
+* ``ImageSimulator.apply_convolution`` no longer hangs on uniform-gray
+  inputs.
 
-* Fixed an indefinite hang in ``ImageSimulator.apply_noise`` when called
-  on an array containing ``NaN`` (numba parallel-fastmath does not handle
-  ``NaN`` Poisson lambdas, hanging the worker thread). ``apply_noise``
-  now raises ``RuntimeError`` with the NaN/Inf counts and shape, failing
-  fast instead of hanging silently.
+* ``ImageSimulator.apply_noise`` now raises ``RuntimeError`` with a
+  diagnostic message if the input contains ``NaN`` or ``Inf``, instead
+  of hanging silently.

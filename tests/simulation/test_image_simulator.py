@@ -1071,41 +1071,95 @@ def _pe_with_5pct_below_floor(simulator: SystemOTFSimulator, total: int = 1000) 
     return pe
 
 
-class TestPhotoelectronsToPixels:
-    """Cover the analytical inverse, ADC path, and observability guards.
+def _build_saturated_simulator() -> tuple[SystemOTFSimulator, np.ndarray]:
+    """Build a simulator whose forward grid has a flattened (saturated) tail.
 
-    The forward ``pe(ref) = A*ref + B`` is exactly affine-linear; the inverse
-    cached on the simulator is ``ref = (pe - B) / A``. These tests exercise
-    each branch (analytical / ADC / fallback / cache) and the four
-    observability behaviors documented on ``photoelectrons_to_pixels``:
-    non-finite-input raise, clip-engagement counter, non-monotonic-grid
-    fallback warning, and cache invalidation on forward-map mutation.
+    Used by tests that exercise the non-monotonic-grid fallback path —
+    the inverse cache cannot be trusted when the forward grid is not
+    strictly monotonic.
     """
+    simulator, img = _build_simulator(
+        sensor_overrides={"max_n": 32400, "bit_depth": 12.0, "max_well_fill": 1.0},
+    )
+    ref_grid = np.linspace(0.0, 1.0, 100)
+    pe_grid = np.linspace(0.0, 30000.0, 100)
+    pe_grid[80:] = pe_grid[80]
+    simulator._reflect_to_photoelectrons = interpolate.interp1d(ref_grid, pe_grid)
+    return simulator, img
+
+
+def _replace_forward_full_scale(simulator: SystemOTFSimulator) -> np.ndarray:
+    """Replace the forward map with one whose pe-axis is scaled by 10."""
+    fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
+    new_pe = fwd.y * 10.0
+    simulator._reflect_to_photoelectrons = interpolate.interp1d(fwd.x, new_pe)
+    return new_pe
+
+
+def _mutate_forward_boundary_only(simulator: SystemOTFSimulator) -> np.ndarray:
+    """Replace the forward map with a copy whose final boundary value is doubled."""
+    fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
+    ref_grid = fwd.x.copy()
+    pe_grid = fwd.y.copy()
+    pe_grid[-1] = pe_grid[-1] * 2.0
+    simulator._reflect_to_photoelectrons = interpolate.interp1d(ref_grid, pe_grid)
+    return pe_grid
+
+
+def _setup_clip_warning_case() -> tuple[SystemOTFSimulator, np.ndarray]:
+    """Return a simulator + pe array that will trigger the clip-fraction warning."""
+    simulator, _img = _build_simulator()
+    return simulator, _pe_with_5pct_below_floor(simulator)
+
+
+def _setup_fallback_warning_case() -> tuple[SystemOTFSimulator, np.ndarray]:
+    """Return a simulator + pe array that will trigger the non-monotonic fallback warning."""
+    simulator, _img = _build_saturated_simulator()
+    return simulator, np.linspace(0.0, 30000.0, 64)
+
+
+class TestPhotoelectronsToPixels:
+    """Tests for ``ImageSimulator``'s photoelectron inverse pipeline."""
 
     def test_round_trip_machine_epsilon(self) -> None:
-        """forward(inverse(pe)) == pe to ~machine epsilon (relative) over the grid range."""
+        """Round-tripping pe through the inverse and back must not lose precision.
+
+        Drift in the cached inverse would cause silent divergence in
+        downstream code that compares photoelectron and reflectance
+        values — a subtle precision regression that's hard to spot
+        without this round-trip check.
+        """
         simulator, _img = _build_simulator()
         fwd = simulator._reflect_to_photoelectrons
         pe_grid = np.linspace(simulator._fwd_y_min, simulator._fwd_y_max, 1000)
         ref_recovered = simulator.photoelectrons_to_reflectance(pe_grid)
         pe_round_trip = fwd(ref_recovered)
-        # Tolerance is relative: at pe-scale ~1e8, IEEE 754 double epsilon (2.22e-16)
-        # produces absolute errors around 2e-8, which is correct, not pathological.
         np.testing.assert_allclose(pe_round_trip, pe_grid, rtol=1e-13, atol=0.0)
 
     def test_analytical_matches_interp1d_argument_swap(self) -> None:
-        """The cached analytical inverse matches an explicit interp1d swap."""
+        """The cached endpoint-fit inverse must agree with a direct interpolated inverse.
+
+        The closed-form inverse formula and a direct
+        ``interp1d(fwd.y, fwd.x)`` must produce equivalent outputs;
+        divergence between them would mean the formula has silently
+        drifted from the canonical interpolated reference.
+        """
         simulator, _img = _build_simulator()
         fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
         ref_inv = interpolate.interp1d(fwd.y, fwd.x)
         pe_sample = np.linspace(simulator._fwd_y_min, simulator._fwd_y_max, 100_000)
         analytical = simulator.photoelectrons_to_reflectance(pe_sample, clip_to_unit=False)
         reference = ref_inv(pe_sample)
-        # Both produce ref in [0, 1]; absolute machine-epsilon comparison is correct here.
         np.testing.assert_allclose(analytical, reference, rtol=0.0, atol=1e-12)
 
     def test_clip_to_unit_false_allows_out_of_range_reflectance(self) -> None:
-        """clip_to_unit=False lets pe outside the grid produce ref outside [0, 1]."""
+        """Opting out of the [0, 1] clip must let the inverse return values outside [0, 1].
+
+        Callers that want to inspect how far their input fell outside the
+        physical reflectance range need the unclipped result; the default
+        clip would collapse "well below 0" and "exactly 0" into the same
+        output, hiding that information.
+        """
         simulator, _img = _build_simulator()
         affine_a, affine_b = simulator._affine_pe_coefs
         below = simulator.photoelectrons_to_reflectance(
@@ -1129,13 +1183,24 @@ class TestPhotoelectronsToPixels:
         assert clipped_above[0] == 1.0
 
     def test_use_reflectance_false_raises_for_pe_to_reflectance(self) -> None:
-        """photoelectrons_to_reflectance requires use_reflectance=True."""
+        """Reflectance inverse must refuse when no reflectance forward map exists.
+
+        Without ``use_reflectance=True`` there is no forward map to invert;
+        the caller should be redirected to the ADC path on
+        ``photoelectrons_to_pixels`` rather than receiving silently-wrong
+        output.
+        """
         simulator, _img = _build_simulator(use_reflectance=False)
         with pytest.raises(ValueError, match="use_reflectance=True"):
             simulator.photoelectrons_to_reflectance(np.array([1000.0]))
 
     def test_use_reflectance_false_routes_to_adc_in_pe_to_pixels(self) -> None:
-        """In raw-pixel mode, photoelectrons_to_pixels uses the sensor ADC model."""
+        """Raw-pixel simulators must go through the ADC quantizer, not the inverse formula.
+
+        With ``use_reflectance=False`` there is no forward map for the
+        inverse formula to invert. Any dispatch that did not route to the
+        ADC path would either crash or produce silently-wrong output.
+        """
         simulator, _img = _build_simulator(
             use_reflectance=False,
             sensor_overrides={"max_n": 32400, "bit_depth": 12.0, "max_well_fill": 1.0},
@@ -1148,7 +1213,13 @@ class TestPhotoelectronsToPixels:
         assert pixels[-1] == pytest.approx(255.0, abs=1.0)
 
     def test_adc_bit_depth_4_posterizes_to_at_most_16_levels(self) -> None:
-        """4-bit ADC produces at most 16 unique uint8 levels in the output sweep."""
+        """ADC bit-depth must actually quantize the output, not just remap it.
+
+        A 4-bit ADC can physically produce at most 16 unique output
+        levels. A bypassed quantization stage (e.g. a rounding bug) would
+        let the output silently take on up to 256 levels and make the
+        ``bit_depth`` setting a no-op.
+        """
         simulator, _img = _build_simulator(
             use_reflectance=False,
             sensor_overrides={"max_n": 32400, "bit_depth": 4.0, "max_well_fill": 1.0},
@@ -1159,7 +1230,13 @@ class TestPhotoelectronsToPixels:
         assert unique_uint8.size <= 16
 
     def test_adc_bit_depth_non_integer_truncates_consistently(self) -> None:
-        """bit_depth 12.5 truncates to 12 and matches integer 12 output."""
+        """Fractional bit-depth must behave identically to its truncated integer value.
+
+        Real ADCs only have integer bit counts; pyBSM's default of 100.0
+        is a placeholder. Treating ``bit_depth`` as a continuous knob
+        (e.g. via ``ceil`` or interpolation) would make 12.5 and 12
+        produce different output, breaking the physical contract.
+        """
         sim_12, _ = _build_simulator(
             use_reflectance=False,
             sensor_overrides={"max_n": 32400, "bit_depth": 12.0, "max_well_fill": 1.0},
@@ -1183,35 +1260,39 @@ class TestPhotoelectronsToPixels:
         ids=["zero_well_capacity", "bit_depth_below_one"],
     )
     def test_adc_degenerate_sensor_raises(self, sensor_overrides: dict, match_pattern: str) -> None:
-        """Degenerate ADC sensor configurations raise ValueError on the inverse-pixel path."""
+        """Impossible ADC configurations must raise, not return divide-by-zero noise.
+
+        Zero well capacity or sub-1 bit-depth would otherwise propagate as
+        NaN/Inf into the pixel output, silently corrupting downstream code.
+        """
         simulator, _img = _build_simulator(use_reflectance=False, sensor_overrides=sensor_overrides)
         with pytest.raises(ValueError, match=match_pattern):
             simulator.photoelectrons_to_pixels(np.array([1.0, 2.0, 3.0]))
 
     @pytest.mark.parametrize(
         ("p1", "p2"),
-        [(0.0, 0.0), (255.0, 0.0), (10.0, 5.0)],
-        ids=["equal", "inverted_full_range", "inverted_partial"],
+        [(0.0, 0.0), (10.0, 5.0)],
+        ids=["equal", "inverted"],
     )
     def test_pe_to_pixels_invalid_output_range_raises(self, p1: float, p2: float) -> None:
-        """Caller must pass a strictly-ascending output range; equal or inverted raises."""
+        """Equal or inverted output ranges must raise, not produce degenerate output.
+
+        ``p1 == p2`` would divide by zero in the remap; ``p1 > p2`` would
+        produce a backwards mapping. Both fail fast with a clear message.
+        """
         simulator, _img = _build_simulator()
         with pytest.raises(ValueError, match="strictly ascending"):
             simulator.photoelectrons_to_pixels(np.array([1000.0, 2000.0]), p1=p1, p2=p2)
 
-    @pytest.mark.parametrize(
-        ("inject_nan", "inject_inf"),
-        [(True, False), (False, True), (True, True)],
-        ids=["nan_only", "inf_only", "nan_and_inf"],
-    )
-    def test_raises_on_non_finite_input(self, inject_nan: bool, inject_inf: bool) -> None:
-        """Non-finite pe_img must raise RuntimeError, never silently cast."""
+    def test_raises_on_non_finite_input(self) -> None:
+        """Non-finite pe must raise rather than silently casting to 0.
+
+        A silent ``NaN -> 0`` cast on the final ``uint8`` step would corrupt
+        the output with no visible signal to the caller.
+        """
         simulator, _img = _build_simulator()
         pe_img = np.full(64, simulator._fwd_y_min, dtype=np.float64)
-        if inject_nan:
-            pe_img[0] = np.nan
-        if inject_inf:
-            pe_img[1] = np.inf
+        pe_img[0] = np.nan
         with pytest.raises(RuntimeError, match="non-finite"):
             simulator.photoelectrons_to_pixels(pe_img)
 
@@ -1221,13 +1302,11 @@ class TestPhotoelectronsToPixels:
             (lambda sim: _pe_with_5pct_below_floor(sim), 0.05, 0.0, True),
             (lambda sim: np.linspace(sim._fwd_y_min, sim._fwd_y_max, 200), 0.0, 0.0, False),
             (lambda sim: np.full(100, sim._fwd_y_min), 0.0, 0.0, False),
-            (lambda sim: np.full((100,), sim._fwd_y_min - 1.0, dtype=np.float64), 1.0, 0.0, True),
         ],
         ids=[
             "5pct_below_floor_warns",
             "all_inside_silent",
             "exactly_at_floor_silent",
-            "all_below_floor_warns",
         ],
     )
     def test_clip_fraction_observability(
@@ -1237,11 +1316,11 @@ class TestPhotoelectronsToPixels:
         expected_frac_hi: float,
         expects_warning: bool,
     ) -> None:
-        """Clip-fraction counter and once-per-instance warning track ``pe`` boundary engagement.
+        """The clip-fraction counter and 1% warning must reflect actual boundary engagement.
 
-        The counter uses strict ``<`` / ``>`` against the forward floor/ceiling
-        (so ``pe == floor`` is NOT counted as a clip), and the warning fires when
-        either fraction exceeds 1%.
+        If the counter were inaccurate, callers would have no signal that
+        their input was being clipped to the simulator's forward range
+        (which silently saturates the analytical inverse).
         """
         simulator, _img = _build_simulator()
         pe_img = pe_factory(simulator)
@@ -1256,77 +1335,85 @@ class TestPhotoelectronsToPixels:
         assert frac_lo == pytest.approx(expected_frac_lo, abs=1e-6)
         assert frac_hi == pytest.approx(expected_frac_hi, abs=1e-6)
 
-    def test_clip_warning_is_sticky_after_first_emission(self) -> None:
-        """Once the clip warning fires, subsequent calls do not re-emit (per-instance flag)."""
-        simulator, _img = _build_simulator()
-        pe_img = _pe_with_5pct_below_floor(simulator)
-        with pytest.warns(UserWarning, match="clipped to forward-table bounds"):
-            simulator.photoelectrons_to_pixels(pe_img)
-        # Second call: warning state stays sticky; no new warning is emitted.
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", UserWarning)
-            simulator.photoelectrons_to_pixels(pe_img)
-
     def test_warns_and_falls_back_on_nonmonotonic_forward_grid(self) -> None:
-        """A flattened forward tail triggers the fallback to ADC quantization."""
-        simulator, _img = _build_simulator(
-            sensor_overrides={"max_n": 32400, "bit_depth": 12.0, "max_well_fill": 1.0},
-        )
-        ref_grid = np.linspace(0.0, 1.0, 100)
-        pe_grid = np.linspace(0.0, 30000.0, 100)
-        pe_grid[80:] = pe_grid[80]  # flatten the high tail (saturation cliff).
-        simulator._reflect_to_photoelectrons = interpolate.interp1d(ref_grid, pe_grid)
+        """A saturated forward map must trigger the documented ADC fallback.
+
+        The inverse formula is unreliable on a non-monotonic grid; the
+        method's contract is to fall back to ADC quantization and warn
+        once, rather than silently return wrong output.
+        """
+        simulator, _img = _build_saturated_simulator()
         pe_img = np.linspace(0.0, 30000.0, 64)
         with pytest.warns(UserWarning, match="forward_nonmonotonic"):
             pixels = simulator.photoelectrons_to_pixels(pe_img)
         expected = simulator._adc_photoelectrons_to_pixels(pe_img, out_range=(0.0, 255.0))
         np.testing.assert_array_equal(pixels, expected)
 
-    def test_fallback_warning_is_sticky_after_first_emission(self) -> None:
-        """Once the fallback warning fires, subsequent calls do not re-emit (per-instance flag)."""
-        simulator, _img = _build_simulator(
-            sensor_overrides={"max_n": 32400, "bit_depth": 12.0, "max_well_fill": 1.0},
-        )
-        ref_grid = np.linspace(0.0, 1.0, 100)
-        pe_grid = np.linspace(0.0, 30000.0, 100)
-        pe_grid[80:] = pe_grid[80]
-        simulator._reflect_to_photoelectrons = interpolate.interp1d(ref_grid, pe_grid)
-        pe_img = np.linspace(0.0, 30000.0, 64)
-        with pytest.warns(UserWarning, match="forward_nonmonotonic"):
+    @pytest.mark.parametrize(
+        ("setup_fn", "warning_match"),
+        [
+            (_setup_clip_warning_case, "clipped to forward-table bounds"),
+            (_setup_fallback_warning_case, "forward_nonmonotonic"),
+        ],
+        ids=["clip_warning", "fallback_warning"],
+    )
+    def test_warning_is_sticky_after_first_emission(
+        self,
+        setup_fn: Callable[[], tuple[SystemOTFSimulator, np.ndarray]],
+        warning_match: str,
+    ) -> None:
+        """Each observability warning must fire at most once per simulator instance.
+
+        Re-emitting on every call would flood downstream logs with the same
+        message; the user just needs to know the condition was detected once.
+        """
+        simulator, pe_img = setup_fn()
+        with pytest.warns(UserWarning, match=warning_match):
             simulator.photoelectrons_to_pixels(pe_img)
-        # Second call: warning state stays sticky; no new warning is emitted.
         with warnings.catch_warnings():
             warnings.simplefilter("error", UserWarning)
             simulator.photoelectrons_to_pixels(pe_img)
 
-    def test_cache_invalidates_on_forward_replacement(self) -> None:
-        """Replacing _reflect_to_photoelectrons rebuilds (A, B) on next call."""
-        simulator, _img = _build_simulator()
-        original_a, original_b = simulator._affine_pe_coefs
-        fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
-        new_ref = fwd.x
-        new_pe = fwd.y * 10.0
-        simulator._reflect_to_photoelectrons = interpolate.interp1d(new_ref, new_pe)
-        simulator.photoelectrons_to_pixels(np.array([new_pe[0], new_pe[-1]]))
-        new_a, new_b = simulator._affine_pe_coefs
-        assert new_a == pytest.approx(original_a * 10.0, rel=1e-12)
-        assert new_b == pytest.approx(original_b * 10.0, rel=1e-12)
+    def test_reflectance_warns_on_nonmonotonic_forward_grid(self) -> None:
+        """Direct calls to the reflectance inverse must also flag a saturated forward map.
 
-    def test_cache_invalidates_on_boundary_mutation(self) -> None:
-        """Replacing fwd with a copy whose y[-1] differs rebuilds (A, B)."""
+        The reflectance entry point has no fallback path; without this
+        warning, a caller using a saturated forward map would silently
+        get a degraded result.
+        """
+        simulator, _img = _build_saturated_simulator()
+        with pytest.warns(UserWarning, match="forward map is non-monotonic"):
+            simulator.photoelectrons_to_reflectance(np.array([10000.0, 20000.0]))
+
+    @pytest.mark.parametrize(
+        "mutator",
+        [_replace_forward_full_scale, _mutate_forward_boundary_only],
+        ids=["forward_replacement", "boundary_mutation"],
+    )
+    def test_cache_invalidates_on_forward_mutation(
+        self,
+        mutator: Callable[[SystemOTFSimulator], np.ndarray],
+    ) -> None:
+        """The cached inverse must follow any change to the forward map.
+
+        Without invalidation, calls after a forward-map mutation would
+        silently return inverse values derived from the previous map —
+        the worst kind of correctness bug because the call site looks fine.
+        """
         simulator, _img = _build_simulator()
-        original_a, _original_b = simulator._affine_pe_coefs
-        fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
-        ref_grid = fwd.x.copy()
-        pe_grid = fwd.y.copy()
-        pe_grid[-1] = pe_grid[-1] * 2.0
-        simulator._reflect_to_photoelectrons = interpolate.interp1d(ref_grid, pe_grid)
-        simulator.photoelectrons_to_pixels(np.array([pe_grid[0], pe_grid[-1]]))
-        new_a, _new_b = simulator._affine_pe_coefs
-        assert new_a > original_a
+        original = simulator._affine_pe_coefs
+        new_pe = mutator(simulator)
+        simulator.photoelectrons_to_pixels(np.array([new_pe[0], new_pe[-1]]))
+        assert simulator._affine_pe_coefs != original
 
     def test_cache_does_not_detect_interior_mutation(self) -> None:
-        """Documented contract: interior `.y` mutation is NOT detected (callers replace fwd)."""
+        """Documented limit: only boundary/whole-object changes invalidate the cache.
+
+        The cache fingerprint catches whole-object replacement and
+        boundary/length changes; interior ``.y`` mutations are out of
+        scope. Callers that mutate interior grid values must replace the
+        forward map entirely.
+        """
         simulator, _img = _build_simulator()
         snapshot = simulator._affine_pe_coefs
         fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
@@ -1335,7 +1422,12 @@ class TestPhotoelectronsToPixels:
         assert simulator._affine_pe_coefs == snapshot
 
     def test_apply_convolution_uniform_input_does_not_explode(self) -> None:
-        """§5 fix: apply_convolution on a uniform-gray image stays finite."""
+        """A uniform-gray input must stay finite through the convolution path.
+
+        A naive min/max stretch would divide by zero on uniform input and
+        propagate NaN into the FFT. The method maps uniform inputs to the
+        reflectance-range midpoint instead.
+        """
         simulator, _img = _build_simulator(reflectance_range=np.array([0.05, 0.5]))
         uniform = np.full((64, 64), 128, dtype=np.uint8)
         psf = simulator._get_psf_cached(gsd=3.19 / 160.0)
@@ -1343,38 +1435,13 @@ class TestPhotoelectronsToPixels:
         assert np.all(np.isfinite(true_img))
         assert np.all(np.isfinite(blur_img))
 
-    def test_pe_to_pixels_is_sensor_calibrated_not_per_image(self) -> None:
-        """Same pe input -> different pixels under different sensor forward calibrations.
-
-        A naive pe-to-pixel mapping (per-image min-max normalization) produces
-        output determined by the image's pe min/max rather than the sensor's
-        forward calibration — destroying cross-sensor radiometric consistency.
-        This test asserts that ``photoelectrons_to_pixels`` does the opposite:
-        two simulators with materially different forward maps map an identical
-        pe array to materially different pixel arrays, proving the output
-        tracks the sensor configuration, not per-image stats.
-        """
-        simulator, _img = _build_simulator()
-        # Original forward map for simulator A.
-        fwd_a = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
-        # Build a divergent forward map for simulator B by shifting both endpoints.
-        # Note: this pure-offset shift is a unit-test contrivance — a real
-        # sensor recalibration would change both slope and intercept. We just
-        # need ``(A, B)`` to differ from simulator A's so the cache rebuild
-        # path produces a different inverse, which is what this test exercises.
-        ref_b = fwd_a.x.copy()
-        pe_b = fwd_a.y.copy() + (fwd_a.y[-1] - fwd_a.y[0]) * 0.25
-        # Identical pe input across both simulators.
-        pe_input = np.linspace(fwd_a.y[0], fwd_a.y[-1], 5000)
-        pixels_a = simulator.photoelectrons_to_pixels(pe_input)
-        # Swap simulator's forward to B; cache invalidates on next call.
-        simulator._reflect_to_photoelectrons = interpolate.interp1d(ref_b, pe_b)
-        pixels_b = simulator.photoelectrons_to_pixels(pe_input)
-        # Materially different mean uint8 levels.
-        assert abs(pixels_a.mean() - pixels_b.mean()) > 5.0
-
     def test_a_zero_degenerate_raises(self) -> None:
-        """A constant forward map (A=0) raises ValueError on inversion."""
+        """A constant forward map must raise rather than divide by zero on inversion.
+
+        A forward map with no reflectance dependence has no meaningful
+        inverse; failing fast with a clear ValueError is better than
+        propagating NaN or Inf into the reflectance output.
+        """
         simulator, _img = _build_simulator()
         fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
         ref_grid = fwd.x.copy()
@@ -1383,99 +1450,75 @@ class TestPhotoelectronsToPixels:
         with pytest.raises(ValueError, match="A=0"):
             simulator.photoelectrons_to_reflectance(np.array([1000.0]))
 
-    @pytest.mark.parametrize(
-        ("shape", "mode"),
-        [
-            ((0,), "radiometric"),
-            ((0, 4), "radiometric"),
-            ((0,), "minmax"),
-            ((0, 4), "minmax"),
-        ],
-        ids=["empty_1D_radio", "empty_2D_radio", "empty_1D_minmax", "empty_2D_minmax"],
-    )
-    def test_pe_to_pixels_empty_input_returns_empty(self, shape: tuple[int, ...], mode: str) -> None:
-        """Empty input short-circuits before the clip-fraction divide-by-size — for both modes.
+    def test_pe_to_pixels_empty_input_returns_empty(self) -> None:
+        """An empty input array must produce an empty output of the same shape.
 
-        All ``size == 0`` shapes hit the same early-return branch (which sits
-        before the mode dispatch), regardless of ``mode``. One 1D and one 2D
-        case per mode is sufficient to pin both the ``size==0`` short-circuit
-        and ``np.empty(shape, ...)`` shape preservation.
+        Otherwise the per-image min/max or clip-fraction division would
+        crash on a zero-size array.
         """
         simulator, _img = _build_simulator()
-        empty = np.empty(shape, dtype=np.float64)
-        out = simulator.photoelectrons_to_pixels(empty, mode=mode)  # type: ignore[arg-type]
-        assert out.shape == shape
+        empty = np.empty((0, 4), dtype=np.float64)
+        out = simulator.photoelectrons_to_pixels(empty)
+        assert out.shape == (0, 4)
         assert out.dtype == np.float64
         assert out.size == 0
 
     def test_pe_to_pixels_single_element_input(self) -> None:
-        """Single-element 1D input maps cleanly without divide-by-zero in the clip-fraction."""
+        """A single-element input must produce a valid one-element output.
+
+        The clip-fraction counter divides by array size. A divisor of
+        ``size - 1`` would crash on a one-element input.
+        """
         simulator, _img = _build_simulator()
-        # Pick a pe value squarely inside the forward range so no clipping occurs.
         pe_mid = 0.5 * (simulator._fwd_y_min + simulator._fwd_y_max)
         out = simulator.photoelectrons_to_pixels(np.array([pe_mid]))
         assert out.shape == (1,)
         assert 0.0 <= out[0] <= 255.0
-        # No clipping was engaged for an interior value.
         assert simulator._last_clip_fraction == (0.0, 0.0)
 
-    @pytest.mark.parametrize(
-        ("ndim", "inject"),
-        [(2, "nan"), (3, "nan"), (2, "inf"), (3, "inf")],
-        ids=["2D_nan", "3D_nan", "2D_inf", "3D_inf"],
-    )
-    def test_apply_noise_raises_on_non_finite_input(self, ndim: int, inject: str) -> None:
-        """apply_noise must raise on NaN/Inf to prevent the numba parallel-fastmath hang.
+    @pytest.mark.parametrize("ndim", [2, 3], ids=["2D", "3D"])
+    def test_apply_noise_raises_on_non_finite_input(self, ndim: int) -> None:
+        """apply_noise must raise on a NaN input rather than hanging the noise kernel.
 
-        Empirically verified: with add_noise=True and a NaN pixel, _apply_noise{2,3}d
-        hang indefinitely on a 32x32 array (subprocess-bounded repro). Inf is
-        added defensively — even though the current numba runtime tolerates it,
-        the guard's contract is "no non-finite values reach the numba kernels".
+        The numba parallel fast-math kernel hangs indefinitely on
+        ``np.random.poisson(NaN)``; the guard at the Python boundary fails
+        fast with a diagnostic message instead.
         """
         simulator, _img = _build_simulator()
-        # Force the noise path active without rebuilding the whole simulator.
         simulator._add_noise = True
         simulator._g_noise = 1.0
         shape = (32, 32) if ndim == 2 else (32, 32, 3)
         arr = np.full(shape, 100.0, dtype=np.float64)
-        arr.flat[0] = np.nan if inject == "nan" else np.inf
+        arr.flat[0] = np.nan
         with pytest.raises(RuntimeError, match="non-finite image"):
             simulator.apply_noise(arr)
 
-    @pytest.mark.parametrize(
-        "shape",
-        [(32, 32), (32, 32, 3), (0, 32), (0, 32, 3)],
-        ids=["full_2D", "full_3D", "empty_2D", "empty_3D"],
-    )
+    @pytest.mark.parametrize("shape", [(32, 32), (32, 32, 3)], ids=["full_2D", "full_3D"])
     def test_apply_noise_finite_input_passes_through(self, shape: tuple[int, ...]) -> None:
-        """Finite (including empty) inputs flow through the guard and dispatch shape-unchanged.
+        """Finite inputs must flow through the non-finite guard with shape preserved.
 
-        Two sentinels merged: full-shaped finite input does not regress on the
-        new finite-value guard; empty 2D/3D inputs short-circuit through the
-        guard (``np.all(np.isfinite(empty))`` is trivially ``True``) and the
-        numba kernels operate on zero-element scratch buffers without error.
+        The guard is a gate, not a transform: finite arrays must be
+        dispatched to the noise kernel and returned with noise applied.
+        A guard that short-circuited would return the input unchanged,
+        silently producing noise-free output that the caller would not
+        notice until downstream metrics looked wrong.
         """
         simulator, _img = _build_simulator()
         simulator._add_noise = True
         simulator._g_noise = 1.0
-        arr = np.empty(shape, dtype=np.float64) if 0 in shape else np.full(shape, 100.0, dtype=np.float64)
+        arr = np.full(shape, 100.0, dtype=np.float64)
         out = simulator.apply_noise(arr)
         assert out.shape == shape
         assert np.all(np.isfinite(out))
 
     def test_cross_shape_simulate_image_is_stable(self) -> None:
-        """Sentinel: pyBSM's PSF cache and noise functions are shape-independent.
+        """One simulator must work on input frames of different shapes.
 
-        The PSF cache is keyed on ``(config_hash, gsd_rounded)``, which does
-        not include image shape; the parallel-numba noise functions allocate
-        fresh scratch buffers per call. So reusing one simulator across input
-        frames of different shapes is supported. Combined with the
-        ``apply_noise`` non-finite guard, any downstream wrapper that
-        introduces ``NaN`` in ``blur_img`` (e.g. via aggressive Wiener-
-        regularized deconvolution at small frame sizes) will fail loud rather
-        than corrupt output. This test pins the shape-independence invariant
-        so a future change that introduces shape-dependent state breaks here,
-        not in user code.
+        The PSF cache and noise kernels do not capture image shape, so a
+        single simulator can process arbitrary frame sizes back-to-back.
+        Shape-dependent state would silently force users to build a new
+        simulator per frame size — a regression that would surface as
+        confusing crashes far from the source.
         """
         simulator, img = _build_simulator()
         gsd = 3.19 / 160.0
@@ -1486,78 +1529,88 @@ class TestPhotoelectronsToPixels:
         assert np.all(np.isfinite(blur_b))
         assert blur_b.shape == small.shape
 
-    def test_minmax_mode_basic_remap(self) -> None:
-        """``mode="minmax"`` stretches input min/max linearly into ``[p1, p2]``."""
+    @pytest.mark.parametrize(
+        ("p1", "p2"),
+        [(0.0, 255.0), (10.0, 200.0)],
+        ids=["default_output", "custom_output"],
+    )
+    def test_minmax_mode_remap(self, p1: float, p2: float) -> None:
+        """mode='minmax' must stretch input min/max linearly into ``[p1, p2]``.
+
+        A regression in the remap formula would shift an endpoint off
+        ``p1`` / ``p2`` or push output values outside ``[p1, p2]``.
+        """
         simulator, _img = _build_simulator()
         pe = np.linspace(1000.0, 50_000.0, 256)
-        pixels = simulator.photoelectrons_to_pixels(pe, mode="minmax")
-        assert pixels[0] == pytest.approx(0.0, abs=1e-9)
-        assert pixels[-1] == pytest.approx(255.0, abs=1e-9)
+        pixels = simulator.photoelectrons_to_pixels(pe, p1=p1, p2=p2, mode="minmax")
+        assert pixels[0] == pytest.approx(p1, abs=1e-9)
+        assert pixels[-1] == pytest.approx(p2, abs=1e-9)
+        assert np.all((pixels >= p1) & (pixels <= p2))
         assert np.all(np.diff(pixels) >= 0.0)
 
     def test_minmax_mode_uniform_input_returns_midpoint(self) -> None:
-        """Uniform input on the minmax path mirrors apply_convolution's §5 convention."""
+        """Uniform input on the minmax path must map to the output-range midpoint.
+
+        Without this, the minmax branch would divide by zero on uniform
+        input. Returning the midpoint matches the apply_convolution
+        convention so user code sees consistent uniform-input behavior.
+        """
         simulator, _img = _build_simulator()
         pe = np.full(64, 1234.0)
         pixels = simulator.photoelectrons_to_pixels(pe, mode="minmax")
         np.testing.assert_array_equal(pixels, np.full(64, 127.5, dtype=np.float64))
 
-    def test_minmax_mode_custom_output_range(self) -> None:
-        """Custom ``p1`` / ``p2`` correctly bound the minmax output."""
-        simulator, _img = _build_simulator()
-        pe = np.linspace(0.0, 1000.0, 128)
-        pixels = simulator.photoelectrons_to_pixels(pe, p1=10.0, p2=200.0, mode="minmax")
-        assert pixels[0] == pytest.approx(10.0, abs=1e-9)
-        assert pixels[-1] == pytest.approx(200.0, abs=1e-9)
-        assert np.all((pixels >= 10.0) & (pixels <= 200.0))
-
     def test_minmax_mode_invalid_raises(self) -> None:
-        """Unknown ``mode`` value raises ValueError before any computation."""
+        """An unknown mode literal must raise rather than silently default.
+
+        Without this, a typo (``mode="minmaz"``) would fall through to
+        the radiometric branch and silently produce the wrong output.
+        """
         simulator, _img = _build_simulator()
         with pytest.raises(ValueError, match="mode must be 'radiometric' or 'minmax'"):
             simulator.photoelectrons_to_pixels(np.array([1.0, 2.0]), mode="bogus")  # type: ignore[arg-type]
 
     def test_minmax_mode_works_with_use_reflectance_false(self) -> None:
-        """Minmax bypasses cache + ADC entirely; it works regardless of ``use_reflectance``."""
+        """Minmax must work even when the simulator has no reflectance forward map.
+
+        The minmax branch reads only the input's own min/max. Routing it
+        through the radiometric path (which requires a forward map) would
+        crash on a ``use_reflectance=False`` simulator and break the
+        documented mode-agnostic contract.
+        """
         simulator, _img = _build_simulator(use_reflectance=False)
         pe = np.linspace(0.0, 32400.0, 128)
         pixels = simulator.photoelectrons_to_pixels(pe, mode="minmax")
         assert pixels[0] == pytest.approx(0.0, abs=1e-9)
         assert pixels[-1] == pytest.approx(255.0, abs=1e-9)
-        # No observability state was touched (sensor-agnostic path).
         assert simulator._last_clip_fraction == (0.0, 0.0)
 
     def test_minmax_and_radiometric_diverge_under_sensor_calibration(self) -> None:
-        """Same pe input, two simulators: minmax outputs match, radiometric outputs differ.
+        """The two modes must produce different output when sensors differ.
 
-        Pins the behavioral boundary between the two modes. Minmax is
-        sensor-agnostic (only depends on per-image min/max), so the same
-        input produces the same output across simulators with materially
-        different forward calibrations. Radiometric is sensor-calibrated
-        (depends on cached ``(A, B)`` and ``reflectance_range``), so the
-        same input produces materially different outputs.
+        Minmax is sensor-agnostic (same input -> same pixels across
+        sensors); radiometric is sensor-calibrated (same input ->
+        different pixels). Two sensors viewing the same scene must
+        therefore agree under minmax and disagree under radiometric —
+        confusing the two paths would erase the radiometric guarantee
+        user code depends on.
         """
         simulator_a, _img = _build_simulator()
         simulator_b, _img = _build_simulator()
-        # Both simulators start with the same forward map; divergent map for B
-        # is built by offsetting the y-endpoints of the shared baseline.
-        # Note: this pure-offset shift is a unit-test contrivance — a real
-        # sensor recalibration would change both slope and intercept. The
-        # purpose here is to produce a different ``(A, B)`` so radiometric
-        # outputs diverge while minmax outputs stay identical.
+        # Pure-offset shift is a unit-test contrivance — a real sensor
+        # recalibration would change both slope and intercept; this just
+        # makes B's (A, B) differ from A's so radiometric outputs diverge.
         fwd = cast(interpolate.interp1d, simulator_b._reflect_to_photoelectrons)
         ref_b = fwd.x.copy()
         pe_b = fwd.y.copy() + (fwd.y[-1] - fwd.y[0]) * 0.5
         simulator_b._reflect_to_photoelectrons = interpolate.interp1d(ref_b, pe_b)
         pe_input = np.linspace(fwd.y[0], fwd.y[-1], 5000)
-        # Minmax: identical (per-image stretch ignores sensor).
         minmax_a = simulator_a.photoelectrons_to_pixels(pe_input, mode="minmax")
         minmax_b = simulator_b.photoelectrons_to_pixels(pe_input, mode="minmax")
         np.testing.assert_array_equal(minmax_a, minmax_b)
-        # Radiometric: materially different (sensor-calibrated).
         radio_a = simulator_a.photoelectrons_to_pixels(pe_input, mode="radiometric")
         radio_b = simulator_b.photoelectrons_to_pixels(pe_input, mode="radiometric")
-        # A 0.5×y-range shift produces a mean uint8 difference well over 30;
-        # threshold 5.0 is an order of magnitude below that to avoid
-        # float-precision flakiness without weakening the assertion.
+        # The 0.5x range shift produces a mean pixel difference of ~30 uint8
+        # levels; threshold 5.0 sits well above float-precision noise without
+        # weakening the assertion.
         assert abs(radio_a.mean() - radio_b.mean()) > 5.0

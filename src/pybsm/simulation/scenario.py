@@ -126,15 +126,15 @@ class Scenario:
             must be exact MODTRAN database entries (see the lists in the
             ``altitude`` and ``ground_range`` parameter docstrings above).
 
-            When ``interp=True``, ``altitude`` may be any value inside the
-            closed interval spanned by the MODTRAN altitude entries listed
-            in the ``altitude`` parameter docstring above (i.e. between the
-            smallest and largest tabulated altitude), and ``ground_range``
-            may be any value in ``[0, max_listed_ground_range]`` for the
-            chosen altitude (the upper bound is altitude-dependent — see the
-            ``ground_range`` parameter docstring above). The atmospheric
-            grid is bilinearly interpolated by
-            ``load_database_atmosphere``. Off-envelope values still raise.
+            When ``interp=True``, ``altitude`` may be any value between the
+            smallest and largest tabulated altitudes, and ``ground_range``
+            may be any value between 0 and the largest tabulated
+            ``ground_range`` for the chosen altitude (the upper bound is
+            altitude-dependent — see the ``ground_range`` parameter docstring
+            above). The atmospheric grid is bilinearly interpolated by
+            ``load_database_atmosphere``. Values outside those limits still
+            raise — interpolation only fills the gaps between tabulated
+            entries, it does not extrapolate beyond them.
         """
         self.name = name
         self._ihaze = ihaze

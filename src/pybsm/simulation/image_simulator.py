@@ -95,7 +95,7 @@ class ImageSimulator(ABC):
             ValueError: If mtf_wavelengths is empty or mtf_weights is empty.
         """
         if use_reflectance and reflectance_range is None:
-            raise ValueError("Must provide refl_values when use_reflectance = True")
+            raise ValueError("Must provide reflectance_range when use_reflectance=True")
 
         if reflectance_range is not None:
             if reflectance_range.shape[0] != 2:
@@ -116,6 +116,10 @@ class ImageSimulator(ABC):
         # Store deep copies to prevent external mutation affecting us
         self._sensor = copy.deepcopy(sensor)
         self._scenario = copy.deepcopy(scenario)
+        # Sensor and scenario are set-once (no public setter, deep-copied above),
+        # so the PSF cache key never changes — compute the hash once instead of
+        # rehashing on every _get_psf_cached lookup.
+        self._config_hash = hash((hash(self._sensor), hash(self._scenario)))
 
         self._use_reflectance = use_reflectance
         self._rng = np.random.default_rng(rng)
@@ -140,13 +144,7 @@ class ImageSimulator(ABC):
 
             if self._use_reflectance:
                 self._reflect_to_photoelectrons: Callable = interpolate.interp1d(ref, pe)
-                # Type-prime the cache attrs so `_build_inverse_cache` sees a
-                # consistent shape on first call. Values are overwritten below.
-                self._fwd_y_min: float = 0.0
-                self._fwd_y_max: float = 0.0
-                self._affine_pe_coefs: tuple[float, float] = (0.0, 0.0)
-                self._inverse_cache_key: tuple[int, float, float, int] = (0, 0.0, 0.0, 0)
-                self._build_inverse_cache(ref, pe)
+                self._init_inverse_coefs(ref, pe)
                 # Once-per-instance warning flags reset only at __init__,
                 # never on cache rebuild.
                 self._inverse_clip_warned: bool = False
@@ -385,11 +383,9 @@ class ImageSimulator(ABC):
 
         Raises:
             RuntimeError: If ``image`` contains any ``NaN`` or ``Inf`` value
-                while ``add_noise`` is enabled. The downstream noise kernels
-                run under numba's parallel fast-math, which hangs the worker
-                thread on a ``NaN`` Poisson lambda; this guard fails fast
-                with a diagnostic message instead of stalling. ``Inf`` is
-                rejected on the same contract.
+                while ``add_noise`` is enabled. Non-finite inputs are not
+                supported; the error message reports the counts and shape
+                so the caller can locate them upstream.
         """
         if not self.add_noise:
             return image
@@ -397,10 +393,10 @@ class ImageSimulator(ABC):
         if not np.all(np.isfinite(image)):
             raise RuntimeError(
                 f"ImageSimulator.apply_noise: non-finite image "
-                f"(nan={int(np.isnan(image).sum())}, "
-                f"inf={int(np.isinf(image).sum())}, shape={image.shape}). "
-                f"_apply_noise2d / _apply_noise3d would hang on NaN under numba "
-                f"parallel-fastmath; refusing to dispatch.",
+                f"({int(np.isnan(image).sum())} NaN, "
+                f"{int(np.isinf(image).sum())} Inf, shape={image.shape}). "
+                f"Clean or filter non-finite values out of the input "
+                f"before calling apply_noise.",
             )
 
         # poisson_noisy_img = self._rng.poisson(lam=image)
@@ -487,9 +483,13 @@ class ImageSimulator(ABC):
             ``float64``.
 
         Raises:
-            ValueError: If ``use_reflectance=False`` (no forward grid exists;
-                use ``photoelectrons_to_pixels`` for the ADC-quantization path).
-            ValueError: If the cached forward map is degenerate (``A == 0``).
+            ValueError: If ``use_reflectance=False``. This method requires
+                reflectance mode; for raw-pixel mode use
+                ``photoelectrons_to_pixels`` (the ADC path).
+            ValueError: If the sensor's radiometric calibration is flat —
+                every reflectance produces the same photoelectron count,
+                so the inverse is undefined. Check the sensor/scenario
+                inputs to ``ImageSimulator``.
         """
         if not self._use_reflectance:
             raise ValueError(
@@ -497,18 +497,20 @@ class ImageSimulator(ABC):
                 "use_reflectance=True; for raw-pixel mode use "
                 "photoelectrons_to_pixels (ADC path).",
             )
-        self._validate_inverse_cache()
         # Non-monotonic forward grid means the endpoint-fit (A, B) does not
         # match interior points; warn once but still return the endpoint-fit
         # result. (The pixel-domain path falls back to ADC in this case;
         # here there is no fallback, so the caller is responsible.)
-        fwd = cast(interpolate.interp1d, self._reflect_to_photoelectrons)
-        if not np.all(np.diff(fwd.y) > 0):
+        if not self._forward_is_monotonic:
             self._warn_inverse_precision_degraded(reason="forward_nonmonotonic")
         affine_a, affine_b = self._affine_pe_coefs
         if affine_a == 0.0:
             raise ValueError(
-                "ImageSimulator.photoelectrons_to_reflectance: forward model has no reflectance dependence (A=0).",
+                "ImageSimulator.photoelectrons_to_reflectance: cannot invert "
+                "because the sensor's radiometric calibration is flat — "
+                "every scene reflectance maps to the same photoelectron "
+                "count, so the input is not recoverable. Check the sensor "
+                "and scenario configuration passed to ImageSimulator.",
             )
         ref = (np.asarray(photoelectrons, dtype=np.float64) - affine_b) / affine_a
         if clip_to_unit:
@@ -605,10 +607,12 @@ class ImageSimulator(ABC):
             )
         if not np.all(np.isfinite(photoelectrons_img)):
             raise RuntimeError(
-                f"ImageSimulator.photoelectrons_to_pixels: non-finite photoelectrons_img "
-                f"(nan={int(np.isnan(photoelectrons_img).sum())}, "
-                f"inf={int(np.isinf(photoelectrons_img).sum())}, shape={photoelectrons_img.shape}). "
-                f"Likely an upstream simulate_image() bug.",
+                f"ImageSimulator.photoelectrons_to_pixels: non-finite "
+                f"photoelectrons_img ({int(np.isnan(photoelectrons_img).sum())} NaN, "
+                f"{int(np.isinf(photoelectrons_img).sum())} Inf, "
+                f"shape={photoelectrons_img.shape}). Clean or filter "
+                f"non-finite values out of the input before calling "
+                f"photoelectrons_to_pixels.",
             )
 
     def _photoelectrons_to_pixels_minmax(
@@ -644,9 +648,7 @@ class ImageSimulator(ABC):
         exceeds 1%), clip to the forward grid endpoints, invert to
         reflectance, and remap from ``reflectance_range`` into ``[p1, p2]``.
         """
-        self._validate_inverse_cache()
-        fwd = cast(interpolate.interp1d, self._reflect_to_photoelectrons)
-        if not np.all(np.diff(fwd.y) > 0):
+        if not self._forward_is_monotonic:
             self._warn_inverse_fallback(reason="forward_nonmonotonic")
             return self._adc_photoelectrons_to_pixels(photoelectrons_img, out_range=(p1, p2))
 
@@ -728,18 +730,19 @@ class ImageSimulator(ABC):
         pixels = (dn / adc_max) * (p_hi - p_lo) + p_lo
         return np.clip(pixels, p_lo, p_hi)
 
-    def _build_inverse_cache(self, ref: np.ndarray, pe: np.ndarray) -> None:
-        """Cache the inverse coefficients ``(A, B)`` derived from the forward grid.
+    def _init_inverse_coefs(self, ref: np.ndarray, pe: np.ndarray) -> None:
+        """Compute and store the inverse coefficients and the monotonicity flag.
 
         ``A`` and ``B`` are taken from the line through the first and last
         grid points. For pyBSM's built-in forward chain this line coincides
         with every interior grid point (reflectance enters the radiance
-        integral only as a scalar multiplier), so the cached inverse is one
-        subtract-divide per pixel instead of a per-call interpolation.
+        integral only as a scalar multiplier), so the inverse is one
+        subtract-divide per pixel instead of a per-call interpolation. The
+        monotonicity flag is computed alongside so both inverse entry points
+        can short-circuit on it without rescanning the forward grid.
 
-        Called from ``__init__`` and ``_validate_inverse_cache`` (rebuild
-        on forward-map replacement / boundary mutation). The once-per-
-        instance warning flags are *not* reset here — only at ``__init__``.
+        Set once at ``__init__``. Tests that swap the forward map post-init
+        must call this explicitly to keep the derived attrs consistent.
 
         Args:
             ref: Reflectance grid array.
@@ -750,32 +753,7 @@ class ImageSimulator(ABC):
         affine_a = float(pe[-1] - pe[0]) / float(ref[-1] - ref[0])
         affine_b = float(pe[0]) - affine_a * float(ref[0])
         self._affine_pe_coefs = (affine_a, affine_b)
-        # Forward-map fingerprint for inverse-cache invalidation. id() catches
-        # whole-object replacement; (y[0], y[-1], len) catches boundary or
-        # length mutation. Known limitation: interior `.y` mutations are NOT
-        # detected — callers must replace the whole forward map for that case.
-        self._inverse_cache_key = (
-            id(self._reflect_to_photoelectrons),
-            self._fwd_y_min,
-            self._fwd_y_max,
-            len(pe),
-        )
-
-    def _validate_inverse_cache(self) -> None:
-        """Rebuild ``(A, B)`` if the forward map was replaced or boundary-mutated.
-
-        The fingerprint is ``(id(fwd), fwd.y[0], fwd.y[-1], len(fwd.y))`` —
-        catches whole-object replacement and boundary/length changes.
-        Mutations to the interior of ``fwd.y`` are out of scope; callers
-        that change interior values must replace the forward map entirely.
-        """
-        if not self._use_reflectance:
-            return
-        fwd = cast(interpolate.interp1d, self._reflect_to_photoelectrons)
-        new_key = (id(fwd), float(fwd.y[0]), float(fwd.y[-1]), len(fwd.y))
-        if new_key == self._inverse_cache_key:
-            return
-        self._build_inverse_cache(fwd.x, fwd.y)
+        self._forward_is_monotonic = bool(np.all(np.diff(pe) > 0))
 
     def _warn_inverse_fallback(self, *, reason: str) -> None:
         """Emit a once-per-instance warning when falling back to ADC quantization.
@@ -877,8 +855,8 @@ class ImageSimulator(ABC):
         pass
 
     def _get_config_hash(self) -> int:
-        """Get hash representing the current sensor/scenario configuration."""
-        return hash((hash(self.sensor), hash(self.scenario)))
+        """Return the cached sensor/scenario configuration hash (set once at ``__init__``)."""
+        return self._config_hash
 
     def _get_psf(self, gsd: float) -> np.ndarray:
         from pybsm.otf.functional import otf_to_psf

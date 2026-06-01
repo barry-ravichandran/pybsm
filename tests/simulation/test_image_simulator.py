@@ -1075,8 +1075,8 @@ def _build_saturated_simulator() -> tuple[SystemOTFSimulator, np.ndarray]:
     """Build a simulator whose forward grid has a flattened (saturated) tail.
 
     Used by tests that exercise the non-monotonic-grid fallback path —
-    the inverse cache cannot be trusted when the forward grid is not
-    strictly monotonic.
+    the analytical inverse cannot be trusted when the forward grid is
+    not strictly monotonic.
     """
     simulator, img = _build_simulator(
         sensor_overrides={"max_n": 32400, "bit_depth": 12.0, "max_well_fill": 1.0},
@@ -1085,25 +1085,8 @@ def _build_saturated_simulator() -> tuple[SystemOTFSimulator, np.ndarray]:
     pe_grid = np.linspace(0.0, 30000.0, 100)
     pe_grid[80:] = pe_grid[80]
     simulator._reflect_to_photoelectrons = interpolate.interp1d(ref_grid, pe_grid)
+    simulator._init_inverse_coefs(ref_grid, pe_grid)
     return simulator, img
-
-
-def _replace_forward_full_scale(simulator: SystemOTFSimulator) -> np.ndarray:
-    """Replace the forward map with one whose pe-axis is scaled by 10."""
-    fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
-    new_pe = fwd.y * 10.0
-    simulator._reflect_to_photoelectrons = interpolate.interp1d(fwd.x, new_pe)
-    return new_pe
-
-
-def _mutate_forward_boundary_only(simulator: SystemOTFSimulator) -> np.ndarray:
-    """Replace the forward map with a copy whose final boundary value is doubled."""
-    fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
-    ref_grid = fwd.x.copy()
-    pe_grid = fwd.y.copy()
-    pe_grid[-1] = pe_grid[-1] * 2.0
-    simulator._reflect_to_photoelectrons = interpolate.interp1d(ref_grid, pe_grid)
-    return pe_grid
 
 
 def _setup_clip_warning_case() -> tuple[SystemOTFSimulator, np.ndarray]:
@@ -1124,8 +1107,8 @@ class TestPhotoelectronsToPixels:
     def test_round_trip_machine_epsilon(self) -> None:
         """Round-tripping pe through the inverse and back must not lose precision.
 
-        Drift in the cached inverse would cause silent divergence in
-        downstream code that compares photoelectron and reflectance
+        Drift in the analytical inverse would cause silent divergence
+        in downstream code that compares photoelectron and reflectance
         values — a subtle precision regression that's hard to spot
         without this round-trip check.
         """
@@ -1137,7 +1120,7 @@ class TestPhotoelectronsToPixels:
         np.testing.assert_allclose(pe_round_trip, pe_grid, rtol=1e-13, atol=0.0)
 
     def test_analytical_matches_interp1d_argument_swap(self) -> None:
-        """The cached endpoint-fit inverse must agree with a direct interpolated inverse.
+        """The endpoint-fit inverse must agree with a direct interpolated inverse.
 
         The closed-form inverse formula and a direct
         ``interp1d(fwd.y, fwd.x)`` must produce equivalent outputs;
@@ -1385,42 +1368,6 @@ class TestPhotoelectronsToPixels:
         with pytest.warns(UserWarning, match="forward map is non-monotonic"):
             simulator.photoelectrons_to_reflectance(np.array([10000.0, 20000.0]))
 
-    @pytest.mark.parametrize(
-        "mutator",
-        [_replace_forward_full_scale, _mutate_forward_boundary_only],
-        ids=["forward_replacement", "boundary_mutation"],
-    )
-    def test_cache_invalidates_on_forward_mutation(
-        self,
-        mutator: Callable[[SystemOTFSimulator], np.ndarray],
-    ) -> None:
-        """The cached inverse must follow any change to the forward map.
-
-        Without invalidation, calls after a forward-map mutation would
-        silently return inverse values derived from the previous map —
-        the worst kind of correctness bug because the call site looks fine.
-        """
-        simulator, _img = _build_simulator()
-        original = simulator._affine_pe_coefs
-        new_pe = mutator(simulator)
-        simulator.photoelectrons_to_pixels(np.array([new_pe[0], new_pe[-1]]))
-        assert simulator._affine_pe_coefs != original
-
-    def test_cache_does_not_detect_interior_mutation(self) -> None:
-        """Documented limit: only boundary/whole-object changes invalidate the cache.
-
-        The cache fingerprint catches whole-object replacement and
-        boundary/length changes; interior ``.y`` mutations are out of
-        scope. Callers that mutate interior grid values must replace the
-        forward map entirely.
-        """
-        simulator, _img = _build_simulator()
-        snapshot = simulator._affine_pe_coefs
-        fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
-        fwd.y[50] = fwd.y[50] * 1.5
-        simulator.photoelectrons_to_pixels(np.array([simulator._fwd_y_min, simulator._fwd_y_max]))
-        assert simulator._affine_pe_coefs == snapshot
-
     def test_apply_convolution_uniform_input_does_not_explode(self) -> None:
         """A uniform-gray input must stay finite through the convolution path.
 
@@ -1436,18 +1383,20 @@ class TestPhotoelectronsToPixels:
         assert np.all(np.isfinite(blur_img))
 
     def test_a_zero_degenerate_raises(self) -> None:
-        """A constant forward map must raise rather than divide by zero on inversion.
+        """A flat sensor calibration must raise rather than divide by zero on inversion.
 
-        A forward map with no reflectance dependence has no meaningful
-        inverse; failing fast with a clear ValueError is better than
-        propagating NaN or Inf into the reflectance output.
+        When the sensor maps every reflectance to the same photoelectron
+        count, the inverse is undefined. Failing fast with a clear
+        ValueError is better than propagating NaN or Inf into the
+        reflectance output.
         """
         simulator, _img = _build_simulator()
         fwd = cast(interpolate.interp1d, simulator._reflect_to_photoelectrons)
         ref_grid = fwd.x.copy()
         pe_const = np.full_like(ref_grid, 1000.0)
         simulator._reflect_to_photoelectrons = interpolate.interp1d(ref_grid, pe_const)
-        with pytest.raises(ValueError, match="A=0"):
+        simulator._init_inverse_coefs(ref_grid, pe_const)
+        with pytest.raises(ValueError, match="radiometric calibration is flat"):
             simulator.photoelectrons_to_reflectance(np.array([1000.0]))
 
     def test_pe_to_pixels_empty_input_returns_empty(self) -> None:
@@ -1604,6 +1553,7 @@ class TestPhotoelectronsToPixels:
         ref_b = fwd.x.copy()
         pe_b = fwd.y.copy() + (fwd.y[-1] - fwd.y[0]) * 0.5
         simulator_b._reflect_to_photoelectrons = interpolate.interp1d(ref_b, pe_b)
+        simulator_b._init_inverse_coefs(ref_b, pe_b)
         pe_input = np.linspace(fwd.y[0], fwd.y[-1], 5000)
         minmax_a = simulator_a.photoelectrons_to_pixels(pe_input, mode="minmax")
         minmax_b = simulator_b.photoelectrons_to_pixels(pe_input, mode="minmax")
